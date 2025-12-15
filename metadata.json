@@ -1,0 +1,7 @@
+{
+  "name": "time recorder",
+  "description": "An accessible voice diary application designed for the elderly to record memories, answer daily prompts, and save audio logs.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
