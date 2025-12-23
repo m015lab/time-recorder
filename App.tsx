@@ -130,15 +130,20 @@ export default function GrandmaVoiceDiary() {
   // 录音状态
   const [isListening, setIsListening] = useState<boolean>(false);
   const [isLoadingMic, setIsLoadingMic] = useState<boolean>(false);
+  const [realtimeText, setRealtimeText] = useState<string>(""); // 实时识别文本
   
   // 数据状态
   const [history, setHistory] = useState<DiaryEntry[]>([]);
   const [showCelebration, setShowCelebration] = useState<boolean>(false);
-  const [savingStatus, setSavingStatus] = useState<string>(''); // 详细的保存状态文字
+  const [savingStatus, setSavingStatus] = useState<string>(''); 
   
   // 媒体录音引用 (存声音)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
+  
+  // 原生语音识别引用 (转文字)
+  const recognitionRef = useRef<any>(null);
+  const recognizedTextRef = useRef<string>(""); // 使用ref防止闭包问题
 
   const debounceTimer = useRef<number | null>(null);
 
@@ -152,10 +157,48 @@ export default function GrandmaVoiceDiary() {
         console.error("Failed to parse history", e);
       }
     }
+
+    // 初始化浏览器原生语音识别 (支持 iOS Safari, Android Chrome, 等)
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true; // 开启实时结果
+      recognition.lang = 'zh-CN'; // 强制中文
+      
+      recognition.onresult = (event: any) => {
+        let final = "";
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            final += event.results[i][0].transcript;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
+        }
+        // 如果有最终结果，累加到 ref
+        if (final) {
+          recognizedTextRef.current += final;
+        }
+        // UI 显示：已确认的部分 + 正在说的部分
+        setRealtimeText(recognizedTextRef.current + interim);
+      };
+
+      recognition.onerror = (event: any) => {
+        console.warn("Speech recognition error", event.error);
+        // 不做过多处理，失败了自然会没有文本，最后降级到 Gemini
+      };
+
+      recognitionRef.current = recognition;
+    }
+
     // 清理
     return () => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
+      }
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
       }
     };
   }, []);
@@ -175,7 +218,6 @@ export default function GrandmaVoiceDiary() {
       const reader = new FileReader();
       reader.onloadend = () => {
         const result = reader.result as string;
-        // 去掉 data:audio/xxx;base64, 前缀
         const base64String = result.split(',')[1];
         resolve(base64String);
       };
@@ -184,14 +226,14 @@ export default function GrandmaVoiceDiary() {
     });
   };
 
-  // --- AI 转录 ---
+  // --- AI 转录 (降级方案) ---
   const transcribeAudio = async (audioBlob: Blob, questionText: string): Promise<string> => {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const base64Data = await blobToBase64(audioBlob);
       
       const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash-exp', // 使用最新的实验模型，音频能力更强
+        model: 'gemini-2.0-flash-exp', 
         contents: {
           parts: [
             { 
@@ -200,19 +242,16 @@ export default function GrandmaVoiceDiary() {
                 data: base64Data 
               } 
             },
-            { text: `任务背景：一位老人在回答这个问题：“${questionText}”。
-任务要求：请将这段录音准确转录为中文文本。
-注意事项：
-1. 结合问题语境进行识别，确保语义连贯。
-2. 如果是方言，尽量转为对应的标准普通话含义。
-3. 去除口头禅、重复和结巴，输出通顺的句子。
-4. 如果录音没有内容或全是噪音，返回空字符串。
-5. 直接输出结果，不要包含“转录如下”等废话。` }
+            { text: `任务：准确转录这段中文录音。
+背景问题：${questionText}
+要求：
+1. 请根据问题语境修正同音字（如"七"听成"吃"等）。
+2. 输出标准简体中文。
+3. 去除口头禅。
+4. 仅输出内容。` }
           ]
         },
-        config: {
-            temperature: 0.2, // 降低随机性，提高准确度
-        }
+        config: { temperature: 0.1 }
       });
       return response.text?.trim() || "";
     } catch (error) {
@@ -228,14 +267,20 @@ export default function GrandmaVoiceDiary() {
     const randomQ = FULL_QUESTION_BANK[randomIndex];
     setQuestion(randomQ);
     setCurrentStep('asking');
+    setRealtimeText(""); // 清空上一轮的文本
+    recognizedTextRef.current = "";
   };
 
   const cancelSession = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
     }
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
     setIsListening(false);
     setIsLoadingMic(false);
+    setRealtimeText("");
     setCurrentStep('welcome');
   };
 
@@ -257,18 +302,28 @@ export default function GrandmaVoiceDiary() {
     setSavingStatus('正在下载音频...');
     downloadAudioBlob(audioBlob);
 
-    setSavingStatus('正在请 AI 帮忙听写...');
+    let finalContent = "";
     
-    // 调用 Gemini 进行转录
-    let transcribedText = "";
-    try {
-       // 传入当前问题作为上下文
-       transcribedText = await transcribeAudio(audioBlob, question.text);
-    } catch (e) {
-       console.error("AI failed", e);
+    // 策略：优先使用原生识别的结果
+    const nativeText = recognizedTextRef.current.trim();
+    
+    if (nativeText && nativeText.length > 2) {
+       // 如果原生识别有较长内容，直接使用
+       console.log("Using native speech recognition result");
+       finalContent = nativeText;
+    } else {
+       // 否则降级使用 AI
+       setSavingStatus('正在请 AI 仔细听辨...');
+       try {
+          finalContent = await transcribeAudio(audioBlob, question.text);
+       } catch (e) {
+          console.error("AI failed", e);
+       }
     }
 
-    const finalContent = transcribedText || "（录音已保存，但文字转录暂时不可用）";
+    if (!finalContent) {
+        finalContent = "（未识别到清晰语音）";
+    }
     
     const newEntry: DiaryEntry = {
       id: Date.now(),
@@ -285,6 +340,9 @@ export default function GrandmaVoiceDiary() {
 
     setCurrentStep('finished');
     setShowCelebration(true);
+    // 重置状态
+    setRealtimeText("");
+    recognizedTextRef.current = "";
   };
 
   const toggleRecording = async () => {
@@ -292,9 +350,12 @@ export default function GrandmaVoiceDiary() {
 
     if (isListening) {
       // --- 停止 ---
+      if (recognitionRef.current) {
+        recognitionRef.current.stop(); // 停止原生识别
+      }
+
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-        // 状态流转在 onstop 回调中处理
+        mediaRecorderRef.current.stop(); // 停止录音，触发 onstop
         setIsListening(false);
         setCurrentStep('saving');
         setSavingStatus('正在保存...');
@@ -302,11 +363,12 @@ export default function GrandmaVoiceDiary() {
     } else {
       // --- 开始 ---
       setIsLoadingMic(true);
+      setRealtimeText("");
+      recognizedTextRef.current = "";
       
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         
-        // 优先使用 mp4，iOS 兼容性更好
         let mimeType = 'audio/webm';
         if (MediaRecorder.isTypeSupported('audio/mp4')) {
             mimeType = 'audio/mp4';
@@ -330,6 +392,15 @@ export default function GrandmaVoiceDiary() {
           processAndFinishEntry(audioBlob);
         };
 
+        // 启动原生识别 (如果有)
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+          } catch (e) {
+            console.warn("Failed to start native recognition", e);
+          }
+        }
+
         mediaRecorder.start();
         setIsListening(true);
         
@@ -343,7 +414,6 @@ export default function GrandmaVoiceDiary() {
   };
 
   const handleShare = async () => {
-    // 获取最新的一条记录
     const latestEntry = history[0];
     const content = latestEntry ? latestEntry.answer : '（奶奶听了听，笑了笑）';
     const shareData = {
@@ -426,16 +496,25 @@ export default function GrandmaVoiceDiary() {
             </p>
           </div>
           
-          <div className="mt-8 w-full min-h-[100px] text-center px-4 flex-1 flex flex-col justify-center">
+          <div className="mt-8 w-full min-h-[120px] text-center px-4 flex-1 flex flex-col justify-center">
             {isListening ? (
-               <div className="flex flex-col items-center animate-pulse opacity-70">
-                  <div className="flex gap-2 mb-4">
-                     <div className="w-3 h-3 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: '0s'}}></div>
-                     <div className="w-3 h-3 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
-                     <div className="w-3 h-3 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: '0.4s'}}></div>
-                  </div>
-                  <p className="text-2xl text-stone-500 font-medium font-kaiti">
-                    正在认真听奶奶说话...
+               <div className="flex flex-col items-center w-full">
+                  {/* 实时文字显示区域 */}
+                  {realtimeText ? (
+                    <div className="mb-4 p-4 bg-stone-100 rounded-xl w-full">
+                      <p className="text-2xl text-stone-800 font-medium font-kaiti leading-relaxed animate-pulse">
+                        “{realtimeText}”
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="flex gap-2 mb-4 h-8 items-center">
+                       <div className="w-3 h-3 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: '0s'}}></div>
+                       <div className="w-3 h-3 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
+                       <div className="w-3 h-3 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: '0.4s'}}></div>
+                    </div>
+                  )}
+                  <p className="text-xl text-stone-500 font-kaiti">
+                    {realtimeText ? "正在记录..." : "正在认真听奶奶说话..."}
                   </p>
                </div>
             ) : (
