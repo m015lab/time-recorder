@@ -284,13 +284,21 @@ export default function GrandmaVoiceDiary() {
     setCurrentStep('welcome');
   };
 
-  const downloadAudioBlob = (blob: Blob) => {
+  const downloadAudioBlob = (blob: Blob, extension: string) => {
     const audioUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = audioUrl;
-    const dateStr = new Date().toLocaleDateString('zh-CN').replace(/\//g, '-');
-    const timeStr = `${new Date().getHours()}点${new Date().getMinutes()}分`;
-    const fileName = `奶奶日记_${dateStr}_${timeStr}.mp4`;
+    
+    // 格式化时间：YYYYMMDD_HHMM
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hour = String(now.getHours()).padStart(2, '0');
+    const minute = String(now.getMinutes()).padStart(2, '0');
+    
+    const fileName = `奶奶日记_${year}${month}${day}_${hour}${minute}.${extension}`;
+    
     a.download = fileName;
     document.body.appendChild(a);
     a.click();
@@ -298,9 +306,11 @@ export default function GrandmaVoiceDiary() {
     URL.revokeObjectURL(audioUrl);
   };
 
-  const processAndFinishEntry = async (audioBlob: Blob) => {
-    setSavingStatus('正在下载音频...');
-    downloadAudioBlob(audioBlob);
+  const processAndFinishEntry = async (audioBlob: Blob, extension: string) => {
+    setSavingStatus('正在自动下载录音...');
+    
+    // 立即触发下载
+    downloadAudioBlob(audioBlob, extension);
 
     let finalContent = "";
     
@@ -369,6 +379,7 @@ export default function GrandmaVoiceDiary() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         
+        // 优先使用 mp4，iOS 兼容性更好
         let mimeType = 'audio/webm';
         if (MediaRecorder.isTypeSupported('audio/mp4')) {
             mimeType = 'audio/mp4';
@@ -389,7 +400,11 @@ export default function GrandmaVoiceDiary() {
         mediaRecorder.onstop = () => {
           const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
           stream.getTracks().forEach(track => track.stop()); // 关掉麦克风
-          processAndFinishEntry(audioBlob);
+          
+          // 确定文件扩展名
+          const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
+          
+          processAndFinishEntry(audioBlob, extension);
         };
 
         // 启动原生识别 (如果有)
